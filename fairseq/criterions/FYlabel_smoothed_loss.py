@@ -105,32 +105,35 @@ class FYLabelSmoothingLoss(FairseqCriterion):
 
         loss_ystar = loss_func(input, targets)
 
-        z_ystar = input.gather(1, targets.unsqueeze(1)).squeeze(1)
+        if self.eps > 0:
+            z_ystar = input.gather(1, targets.unsqueeze(1)).squeeze(1)
 
-        # compute theta_avg (ignore the ignore index)
-        # if your smoothing distribution p is not uniform, you need to do
-        # something other than this. Specifically, p^T theta
-        if self.smooth_p is not None:
-            # weighted sum of the logits
-            # smooth_p should be size n_classes
-            assert self.smooth_p.size(0) == input.size(-1)
-            z_bar = input @ self.smooth_p
-        else:
-            if 0 <= self.padding_idx < input.size(-1):
-                z_sum = input.sum(dim=1) - input[:, self.padding_idx]
-                z_bar = z_sum / (input.size(-1) - 1)
+            # compute theta_avg (ignore the ignore index)
+            # if your smoothing distribution p is not uniform, you need to do
+            # something other than this. Specifically, p^T theta
+            if self.smooth_p is not None:
+                # weighted sum of the logits
+                # smooth_p should be size n_classes
+                assert self.smooth_p.size(0) == input.size(-1)
+                z_bar = input @ self.smooth_p
             else:
-                z_bar = input.mean(dim=1)
+                if 0 <= self.padding_idx < input.size(-1):
+                    z_sum = input.sum(dim=1) - input[:, self.padding_idx]
+                    z_bar = z_sum / (input.size(-1) - 1)
+                else:
+                    z_bar = input.mean(dim=1)
 
-        loss_smooth = self.eps * (z_ystar - z_bar)  # size n
-        loss_smooth.masked_fill_(targets == self.padding_idx, 0.0)
+            loss_smooth = self.eps * (z_ystar - z_bar)  # size n
+            loss_smooth.masked_fill_(targets == self.padding_idx, 0.0)
 
-        loss_smooth = loss_smooth.sum()
-        # if self.reduction != "none":
-            # loss_smooth = loss_smooth.sum()
-        # if self.reduction == "mean":
-            # n_nonpad = targets.ne(self.padding_idx).sum().item()
-            # loss_smooth = loss_smooth / n_nonpad
+            loss_smooth = loss_smooth.sum()
+            # if self.reduction != "none":
+                # loss_smooth = loss_smooth.sum()
+            # if self.reduction == "mean":
+                # n_nonpad = targets.ne(self.padding_idx).sum().item()
+                # loss_smooth = loss_smooth / n_nonpad
+        else:
+            loss_smooth = 0.0
         return loss_ystar + loss_smooth, loss_ystar
 
     def get_lprobs_and_target(self, model, net_output, sample):
