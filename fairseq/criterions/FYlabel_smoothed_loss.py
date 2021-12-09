@@ -13,8 +13,14 @@ from fairseq.dataclass import FairseqDataclass
 from omegaconf import II
 
 
+def merge_first_two_dims(tensor):
+    assert tensor.ndim >= 2
+    shapes = tensor.shape
+    new_shape = [shapes[0] * shapes[1], ] + list(shapes[2:])
+    return tensor.reshape(new_shape)
+
 @dataclass
-class LabelSmoothedCrossEntropyCriterionConfig(FairseqDataclass):
+class FYLabelSmoothedCrossEntropyCriterionConfig(FairseqDataclass):
     label_smoothing: float = field(
         default=0.0,
         metadata={"help": "epsilon for label smoothing, 0 means no label smoothing"},
@@ -30,30 +36,13 @@ class LabelSmoothedCrossEntropyCriterionConfig(FairseqDataclass):
     sentence_avg: bool = II("optimization.sentence_avg")
 
 
-def label_smoothed_nll_loss(lprobs, target, epsilon, ignore_index=None, reduce=True):
-    if target.dim() == lprobs.dim() - 1:
-        target = target.unsqueeze(-1)
-    nll_loss = -lprobs.gather(dim=-1, index=target)
-    smooth_loss = -lprobs.sum(dim=-1, keepdim=True)
-    if ignore_index is not None:
-        pad_mask = target.eq(ignore_index)
-        nll_loss.masked_fill_(pad_mask, 0.0)
-        smooth_loss.masked_fill_(pad_mask, 0.0)
-    else:
-        nll_loss = nll_loss.squeeze(-1)
-        smooth_loss = smooth_loss.squeeze(-1)
-    if reduce:
-        nll_loss = nll_loss.sum()
-        smooth_loss = smooth_loss.sum()
-    eps_i = epsilon / (lprobs.size(-1) - 1)
-    loss = (1.0 - epsilon - eps_i) * nll_loss + eps_i * smooth_loss
-    return loss, nll_loss
-
+# copy and edit from 
+# https://github.com/deep-spin/S7/blob/main/joeynmt/loss.py
 
 @register_criterion(
-    "label_smoothed_cross_entropy", dataclass=LabelSmoothedCrossEntropyCriterionConfig
+    "fy_label_smoothed_cross_entropy", dataclass=FYLabelSmoothedCrossEntropyCriterionConfig
 )
-class LabelSmoothedCrossEntropyCriterion(FairseqCriterion):
+class FYLabelSmoothingLoss(FairseqCriterion):
     def __init__(
         self,
         task,
@@ -61,13 +50,16 @@ class LabelSmoothedCrossEntropyCriterion(FairseqCriterion):
         label_smoothing,
         ignore_prefix_size=0,
         report_accuracy=False,
+        smooth_p=None,
     ):
         super().__init__(task)
         self.sentence_avg = sentence_avg
         self.eps = label_smoothing
         self.ignore_prefix_size = ignore_prefix_size
         self.report_accuracy = report_accuracy
+        self.smooth_p = smooth_p
 
+    # def forward(self, input, targets):
     def forward(self, model, sample, reduce=True):
         """Compute the loss for the given sample.
 
@@ -75,6 +67,11 @@ class LabelSmoothedCrossEntropyCriterion(FairseqCriterion):
         1) the loss
         2) the sample size, which is used as the denominator for the gradient
         3) logging outputs to display while training
+        """
+
+        """
+        input (FloatTensor), n x V: logits
+        targets (LongTensor), n: gold labels
         """
         net_output = model(**sample["net_input"])
         loss, nll_loss = self.compute_loss(model, net_output, sample, reduce=reduce)
@@ -94,6 +91,48 @@ class LabelSmoothedCrossEntropyCriterion(FairseqCriterion):
             logging_output["total"] = utils.item(total.data)
         return loss, sample_size, logging_output
 
+
+    def compute_loss(self, model, net_output, sample, reduce=True):
+        # logits
+        input = net_output[0]
+        targets = sample['target']
+        input = merge_first_two_dims(input)
+        targets = merge_first_two_dims(targets)
+
+        # reshape to logits -> n x V and target -> n
+        from entmax import SparsemaxLoss
+        loss_func = SparsemaxLoss(k=500, ignore_index=self.padding_idx, reduction='sum')
+
+        loss_ystar = loss_func(input, targets)
+
+        z_ystar = input.gather(1, targets.unsqueeze(1)).squeeze(1)
+
+        # compute theta_avg (ignore the ignore index)
+        # if your smoothing distribution p is not uniform, you need to do
+        # something other than this. Specifically, p^T theta
+        if self.smooth_p is not None:
+            # weighted sum of the logits
+            # smooth_p should be size n_classes
+            assert self.smooth_p.size(0) == input.size(-1)
+            z_bar = input @ self.smooth_p
+        else:
+            if 0 <= self.padding_idx < input.size(-1):
+                z_sum = input.sum(dim=1) - input[:, self.padding_idx]
+                z_bar = z_sum / (input.size(-1) - 1)
+            else:
+                z_bar = input.mean(dim=1)
+
+        loss_smooth = self.eps * (z_ystar - z_bar)  # size n
+        loss_smooth.masked_fill_(targets == self.padding_idx, 0.0)
+
+        loss_smooth = loss_smooth.sum()
+        # if self.reduction != "none":
+            # loss_smooth = loss_smooth.sum()
+        # if self.reduction == "mean":
+            # n_nonpad = targets.ne(self.padding_idx).sum().item()
+            # loss_smooth = loss_smooth / n_nonpad
+        return loss_ystar + loss_smooth, loss_ystar
+
     def get_lprobs_and_target(self, model, net_output, sample):
         lprobs = model.get_normalized_probs(net_output, log_probs=True)
         target = model.get_targets(sample, net_output)
@@ -105,17 +144,6 @@ class LabelSmoothedCrossEntropyCriterion(FairseqCriterion):
                 lprobs = lprobs[self.ignore_prefix_size :, :, :].contiguous()
                 target = target[self.ignore_prefix_size :, :].contiguous()
         return lprobs.view(-1, lprobs.size(-1)), target.view(-1)
-
-    def compute_loss(self, model, net_output, sample, reduce=True):
-        lprobs, target = self.get_lprobs_and_target(model, net_output, sample)
-        loss, nll_loss = label_smoothed_nll_loss(
-            lprobs,
-            target,
-            self.eps,
-            ignore_index=self.padding_idx,
-            reduce=reduce,
-        )
-        return loss, nll_loss
 
     def compute_accuracy(self, model, net_output, sample):
         lprobs, target = self.get_lprobs_and_target(model, net_output, sample)
