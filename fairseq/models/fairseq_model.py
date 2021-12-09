@@ -76,19 +76,10 @@ class BaseFairseqModel(nn.Module):
         net_output: Tuple[Tensor, Optional[Dict[str, List[Optional[Tensor]]]]],
         log_probs: bool,
         sample: Optional[Dict[str, Tensor]] = None,
+        sparsemax_alpha: float=1.0, 
     ):
         """Scriptable helper function for get_normalized_probs in ~BaseFairseqModel"""
-        if hasattr(self, "decoder"):
-            return self.decoder.get_normalized_probs(net_output, log_probs, sample)
-        elif torch.is_tensor(net_output):
-            # syntactic sugar for simple models which don't have a decoder
-            # (e.g., the classification tutorial)
-            logits = net_output.float()
-            if log_probs:
-                return F.log_softmax(logits, dim=-1)
-            else:
-                return F.softmax(logits, dim=-1)
-        raise NotImplementedError
+        return self.decoder.get_normalized_probs(net_output, log_probs, sample)
 
     def extract_features(self, *args, **kwargs):
         """Similar to *forward* but only return features."""

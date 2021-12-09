@@ -35,6 +35,7 @@ from .transpose_last import TransposeLast
 from .unfold import unfold1d
 from .transformer_layer import TransformerDecoderLayer, TransformerEncoderLayer
 from .vggblock import VGGBlock
+from .better_sparsemax import BetterSparsemax
 
 __all__ = [
     "AdaptiveInput",
@@ -73,4 +74,5 @@ __all__ = [
     "TransposeLast",
     "VGGBlock",
     "unfold1d",
+    "BetterSparsemax",
 ]

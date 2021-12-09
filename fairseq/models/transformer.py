@@ -191,6 +191,9 @@ class TransformerModel(FairseqEncoderDecoderModel):
                             help='block size of quantization noise at training time')
         parser.add_argument('--quant-noise-scalar', type=float, metavar='D', default=0,
                             help='scalar quantization noise and scalar quantization at training time')
+        parser.add_argument('--sparsemax-alpha', type=float, metavar='D', default=1.0,
+                            help='alpha value for sparsemax, 1.0 for original softmax.')
+
         # fmt: on
 
     @classmethod
@@ -314,8 +317,19 @@ class TransformerModel(FairseqEncoderDecoderModel):
         sample: Optional[Dict[str, Tensor]] = None,
     ):
         """Get normalized probabilities (or log probs) from a net's output."""
-        return self.get_normalized_probs_scriptable(net_output, log_probs, sample)
+        return self.get_normalized_probs_scriptable(net_output, log_probs, sample, self.args.sparsemax_alpha)
 
+    def get_normalized_probs_scriptable(
+        self,
+        net_output: Tuple[Tensor, Optional[Dict[str, List[Optional[Tensor]]]]],
+        log_probs: bool,
+        sample: Optional[Dict[str, Tensor]] = None,
+        sparsemax_alpha: float=1.0, 
+    ):
+        """Scriptable helper function for get_normalized_probs in ~BaseFairseqModel.
+        Add sparsemax operations.
+        """
+        return self.decoder.get_normalized_probs(net_output, log_probs, sample, sparsemax_alpha)
 
 class TransformerEncoder(FairseqEncoder):
     """
@@ -922,6 +936,51 @@ class TransformerDecoder(FairseqIncrementalDecoder):
             return self.output_projection(features)
         else:
             return features
+    
+    def get_normalized_probs(
+        self,
+        net_output: Tuple[Tensor, Optional[Dict[str, List[Optional[Tensor]]]]],
+        log_probs: bool,
+        sample: Optional[Dict[str, Tensor]] = None,
+        sparsemax_alpha: float=1.0,
+    ):
+        """Get normalized probabilities (or log probs) from a net's output."""
+        return self.get_normalized_probs_scriptable(net_output, log_probs, sample, sparsemax_alpha)
+
+    # TorchScript doesn't support super() method so that the scriptable Subclass
+    # can't access the base class model in Torchscript.
+    # Current workaround is to add a helper function with different name and
+    # call the helper function from scriptable Subclass.
+    def get_normalized_probs_scriptable(
+        self,
+        net_output: Tuple[Tensor, Optional[Dict[str, List[Optional[Tensor]]]]],
+        log_probs: bool,
+        sample: Optional[Dict[str, Tensor]] = None,
+        sparsemax_alpha: float=1.0,
+    ):
+        """Get normalized probabilities (or log probs) from a net's output."""
+
+        logits = net_output[0]
+        if sparsemax_alpha != 1.0:
+            from entmax import sparsemax, entmax15, entmax_bisect
+            from fairseq.modules import BetterSparsemax
+            # if log_probs is True:
+                # import pdb; pdb.set_trace()
+            if sparsemax_alpha == 1.5:
+                # TODO: make sure entmax15 is good.
+                ret = entmax15(logits, dim=-1)
+            elif sparsemax_alpha == 2.0:
+                ret = BetterSparsemax(logits, dim=-1)
+            else:
+                raise ValueError("Sparsemax alpha value {} is not supported!".format(sparsemax_alpha))
+            if log_probs:
+                ret = torch.log(ret)
+            return ret
+
+        if log_probs:
+            return utils.log_softmax(logits, dim=-1, onnx_trace=self.onnx_trace)
+        else:
+            return utils.softmax(logits, dim=-1, onnx_trace=self.onnx_trace)
 
     def max_positions(self):
         """Maximum output length supported by the decoder."""
