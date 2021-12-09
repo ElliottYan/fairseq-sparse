@@ -970,7 +970,8 @@ class TransformerDecoder(FairseqIncrementalDecoder):
                 # TODO: make sure entmax15 is good.
                 ret = entmax15(logits, dim=-1)
             elif sparsemax_alpha == 2.0:
-                ret = BetterSparsemax(logits, dim=-1)
+                sparsemax_func = BetterSparsemax()
+                ret = sparsemax_func(logits)
             else:
                 raise ValueError("Sparsemax alpha value {} is not supported!".format(sparsemax_alpha))
             if log_probs:
